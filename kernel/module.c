@@ -3684,6 +3684,11 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	char *after_dashes;
 
 	err = elf_header_check(info);
+
+	//FIXME
+	flags |= MODULE_INIT_IGNORE_MODVERSIONS;
+	flags |= MODULE_INIT_IGNORE_VERMAGIC;
+
 	if (err)
 		goto free_copy;
 
