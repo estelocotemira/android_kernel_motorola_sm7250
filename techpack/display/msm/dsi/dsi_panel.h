@@ -40,8 +40,11 @@
 
 #define BRIGHTNESS_HBM_ON	0xFFFFFFFE
 #define BRIGHTNESS_HBM_OFF	(BRIGHTNESS_HBM_ON - 1)
-#define HBM_BRIGHTNESS(value) ((value) == HBM_ON_STATE ?\
-			BRIGHTNESS_HBM_ON : BRIGHTNESS_HBM_OFF)
+#define HBM_BRIGHTNESS(value) ((value) == HBM_OFF_STATE ?\
+			BRIGHTNESS_HBM_OFF : BRIGHTNESS_HBM_ON)
+
+#define MAX_GAMMA_VALUE_CONT 30
+#define MAX_GAMMA_REG_CONT 9
 
 /* HBM implementation is different, depending on display and backlight hardware
  * design, which is classified into the following types:
@@ -323,13 +326,16 @@ struct dsi_panel {
 
 	enum touch_state tp_state;
 	bool tp_state_check_enable;
+	bool boe_nt37800_dcmode_workaround;
 
 	int panel_recovery_retry;
 	bool is_panel_dead;
+	u8  boe_gamma_read_val[MAX_GAMMA_REG_CONT][MAX_GAMMA_VALUE_CONT];
+	bool boe_gamma_read;
 
 	struct brightness_alpha_pair *fod_dim_lut;
 	u32 fod_dim_lut_count;
-	
+
 	bool hbm_state;
 	bool acl_state;
 	bool cabc_state;

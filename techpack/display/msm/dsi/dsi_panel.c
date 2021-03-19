@@ -25,6 +25,7 @@
 #include "dsi_panel.h"
 #include "dsi_ctrl_hw.h"
 #include "dsi_parser.h"
+#include "sde_dbg.h"
 #include "dsi_display.h"
 
 #if defined(CONFIG_DRM_DYNAMIC_REFRESH_RATE)
@@ -423,6 +424,7 @@ int dsi_panel_trigger_esd_attack(struct dsi_panel *panel)
 
 	if (gpio_is_valid(r_config->reset_gpio)) {
 		gpio_set_value(r_config->reset_gpio, 0);
+		SDE_EVT32(SDE_EVTLOG_FUNC_CASE1);
 		DSI_INFO("GPIO pulled low to simulate ESD\n");
 		return 0;
 	}
@@ -644,6 +646,7 @@ static int dsi_panel_tx_cmd_set(struct dsi_panel *panel,
 	cmds = mode->priv_info->cmd_sets[type].cmds;
 	count = mode->priv_info->cmd_sets[type].count;
 	state = mode->priv_info->cmd_sets[type].state;
+	SDE_EVT32(type, state, count);
 
 	if (count == 0) {
 		DSI_DEBUG("[%s] No commands to be sent for state(%d)\n",
@@ -919,6 +922,9 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	if (dsi_panel_set_hbm_backlight(panel, &bl_lvl))
 		return 0;
 
+	if( bl_lvl < panel->bl_config.bl_min_level && bl_lvl != 0)
+             bl_lvl = panel->bl_config.bl_min_level;
+
 	DSI_DEBUG("backlight type:%d lvl:%d\n", bl->type, bl_lvl);
 	switch (bl->type) {
 	case DSI_BACKLIGHT_WLED:
@@ -1004,6 +1010,9 @@ static int dsi_panel_send_param_cmd(struct dsi_panel *panel,
 	struct panel_param *panel_param;
 	struct dsi_cmd_desc *cmds;
 	ssize_t len;
+	int i = 0;
+	int count = 0;
+
 	const struct mipi_dsi_host_ops *ops = panel->host->ops;
 
 	panel_param = &panel->param_cmds[param_info->param_idx];
@@ -1041,15 +1050,24 @@ static int dsi_panel_send_param_cmd(struct dsi_panel *panel,
 		}
 
 		cmds = param_map_state->cmds->cmds;
-		if (param_map_state->cmds->state == DSI_CMD_SET_STATE_LP)
-			cmds->msg.flags |= MIPI_DSI_MSG_USE_LPM |
-						MIPI_DSI_MSG_LASTCOMMAND;
-		len = ops->transfer(panel->host, &cmds->msg);
-		if (len < 0) {
-			rc = len;
-			DSI_ERR("%s:failed to send param cmd, rc=%d\n",
-					__func__, rc);
-			goto end;
+		count = param_map_state->cmds->count;
+		for (i = 0; i < count; i++) {
+		        if (param_map_state->cmds->state == DSI_CMD_SET_STATE_LP)
+		              cmds->msg.flags |= MIPI_DSI_MSG_USE_LPM;
+
+		        if (cmds->last_command)
+		              cmds->msg.flags |= MIPI_DSI_MSG_LASTCOMMAND;
+
+		        len = ops->transfer(panel->host, &cmds->msg);
+		        if (len < 0) {
+		              rc = len;
+		              DSI_ERR("failed to set cmds, rc=%d\n", rc);
+		              goto end;
+		        }
+		        if (cmds->post_wait_ms)
+		              usleep_range(cmds->post_wait_ms*1000,
+		                       ((cmds->post_wait_ms*1000)+10));
+		        cmds++;
 		}
 
 		panel_param->value = param_info->value;
@@ -1067,9 +1085,20 @@ static int dsi_panel_set_hbm(struct dsi_panel *panel,
                         struct msm_param_info *param_info)
 {
 	int rc = 0;
+        char name[30], val[30];
+	char *envp[3];
 
 	pr_info("Set HBM to (%d)\n", param_info->value);
 
+	snprintf(name, 30, "name=%s", "HBM");
+	snprintf(val, 30, "status=%d", param_info->value);
+	pr_info("[%s] [%s]\n", name, val);
+	envp[0] = name;
+	envp[1] = val;
+	envp[2] = NULL;
+	kobject_uevent_env(&panel->parent->kobj, KOBJ_CHANGE, envp);
+
+	pr_info("Set HBM to (%d)\n", param_info->value);
 	rc = dsi_panel_send_param_cmd(panel, param_info);
 	if (rc < 0) {
 		DSI_ERR("%s: failed to send param cmds. ret=%d\n", __func__, rc);
@@ -1609,6 +1638,9 @@ static int dsi_panel_parse_misc_host_config(struct dsi_host_common_cfg *host,
 		host->t_clk_pre = val;
 		DSI_DEBUG("[%s] t_clk_pre = %d\n", name, val);
 	}
+
+	host->t_clk_pre_extend = utils->read_bool(utils->data,
+						"qcom,mdss-dsi-t-clk-pre-extend");
 
 	host->ignore_rx_eot = utils->read_bool(utils->data,
 						"qcom,mdss-dsi-rx-eot-ignore");
@@ -3093,6 +3125,27 @@ int dsi_dsc_populate_static_param(struct msm_display_dsc_info *dsc)
 	return 0;
 }
 
+static int dsi_panel_parse_phy_ldo(struct dsi_display_mode *mode,
+		struct dsi_parser_utils *utils)
+{
+	u32 data;
+	int rc = 0;
+	struct dsi_display_mode_priv_info *priv_info;
+
+	if (!mode || !mode->priv_info)
+		return -EINVAL;
+
+	priv_info = mode->priv_info;
+
+	rc = utils->read_u32(utils->data,
+			"qcom,mdss-dsi-panel-phy-drive-strength", &data);
+	if (rc)
+		DSI_DEBUG("Unsupport to set Phy Driver Strength\n");
+	else
+		priv_info->phy_drive_strength = data;
+
+	return rc;
+}
 
 static int dsi_panel_parse_phy_timing(struct dsi_display_mode *mode,
 		struct dsi_parser_utils *utils)
@@ -3942,6 +3995,9 @@ static int dsi_panel_parse_mot_panel_config(struct dsi_panel *panel,
 
 	panel->tp_state_check_enable = of_property_read_bool(of_node,
 				"qcom,tp_state_check_enable");
+
+	panel->boe_nt37800_dcmode_workaround = of_property_read_bool(of_node,
+				"qcom,boe_nt37800_dcmode_workaround");
 	return rc;
 }
 
@@ -4580,6 +4636,12 @@ int dsi_panel_get_mode(struct dsi_panel *panel,
 			DSI_ERR(
 			"failed to parse panel jitter config, rc=%d\n", rc);
 
+		rc = dsi_panel_parse_phy_ldo(mode, utils);
+		if (rc) {
+			DSI_ERR(
+			"failed to parse panel phy ldo rc=%d\n", rc);
+		}
+
 		rc = dsi_panel_parse_phy_timing(mode, utils);
 		if (rc) {
 			DSI_ERR(
@@ -5018,6 +5080,7 @@ int dsi_panel_send_roi_dcs(struct dsi_panel *panel, int ctrl_idx,
 	}
 	DSI_DEBUG("[%s] send roi x %d y %d w %d h %d\n", panel->name,
 			roi->x, roi->y, roi->w, roi->h);
+	SDE_EVT32(roi->x, roi->y, roi->w, roi->h);
 
 	mutex_lock(&panel->panel_lock);
 
@@ -5091,6 +5154,13 @@ int dsi_panel_mode_switch_to_cmd(struct dsi_panel *panel)
 		       panel->name, rc);
 
 	mutex_unlock(&panel->panel_lock);
+#if defined(CONFIG_DRM_DYNAMIC_REFRESH_RATE)
+	/* notify consumers only if refresh rate has been updated */
+	if (!rc) {
+		blocking_notifier_call_chain(&dsi_freq_head,
+			(unsigned long)panel->cur_mode->timing.refresh_rate, NULL);
+	}
+#endif
 	return rc;
 }
 
@@ -5111,13 +5181,6 @@ int dsi_panel_mode_switch_to_vid(struct dsi_panel *panel)
 		       panel->name, rc);
 
 	mutex_unlock(&panel->panel_lock);
-#if defined(CONFIG_DRM_DYNAMIC_REFRESH_RATE)
-	/* notify consumers only if refresh rate has been updated */
-	if (!rc) {
-		blocking_notifier_call_chain(&dsi_freq_head,
-			(unsigned long)panel->cur_mode->timing.refresh_rate, NULL);
-	}
-#endif
 	return rc;
 }
 
@@ -5181,7 +5244,8 @@ int dsi_panel_enable(struct dsi_panel *panel)
 		       panel->name, rc);
 		goto err;
 	}
-
+        if (panel->boe_nt37800_dcmode_workaround)
+	        dsi_panel_gamma_work_around(panel);
 	if (!panel->no_panel_on_read_support) {
 		rc = dsi_panel_get_pwr_mode(panel, &pwr_mode);
 		if (rc) {
