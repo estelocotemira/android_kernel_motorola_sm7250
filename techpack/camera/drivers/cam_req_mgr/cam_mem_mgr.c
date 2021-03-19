@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -177,18 +177,22 @@ static int32_t cam_mem_get_slot(void)
 	int32_t idx;
 
 	mutex_lock(&tbl.m_lock);
-	idx = find_first_zero_bit(tbl.bitmap, tbl.bits);
-	if (idx >= CAM_MEM_BUFQ_MAX || idx <= 0) {
+	if (tbl.bitmap) {
+		idx = find_first_zero_bit(tbl.bitmap, tbl.bits);
+		if (idx >= CAM_MEM_BUFQ_MAX || idx <= 0) {
+			mutex_unlock(&tbl.m_lock);
+			return -ENOMEM;
+		}
+
+		set_bit(idx, tbl.bitmap);
+		tbl.bufq[idx].active = true;
+		mutex_init(&tbl.bufq[idx].q_lock);
 		mutex_unlock(&tbl.m_lock);
-		return -ENOMEM;
+		return idx;
 	}
 
-	set_bit(idx, tbl.bitmap);
-	tbl.bufq[idx].active = true;
-	mutex_init(&tbl.bufq[idx].q_lock);
 	mutex_unlock(&tbl.m_lock);
-
-	return idx;
+	return -EINVAL;
 }
 
 static void cam_mem_put_slot(int32_t idx)
@@ -469,6 +473,10 @@ static int cam_mem_util_ion_alloc(struct cam_mem_mgr_alloc_cmd *cmd,
 	} else {
 		heap_id = ION_HEAP(ION_SYSTEM_HEAP_ID) |
 			ION_HEAP(ION_CAMERA_HEAP_ID);
+
+		if (cmd->len > 0x200000) {
+			heap_id |= ION_HEAP(ION_MMNS_HEAP_ID);
+		}
 	}
 
 	if (cmd->flags & CAM_MEM_FLAG_CACHE)
@@ -653,6 +661,7 @@ int cam_mem_mgr_alloc_and_map(struct cam_mem_mgr_alloc_cmd *cmd)
 		goto slot_fail;
 	}
 
+	mutex_lock(&tbl.m_lock);
 	if ((cmd->flags & CAM_MEM_FLAG_HW_READ_WRITE) ||
 		(cmd->flags & CAM_MEM_FLAG_HW_SHARED_ACCESS) ||
 		(cmd->flags & CAM_MEM_FLAG_PROTECTED_MODE)) {
@@ -682,10 +691,11 @@ int cam_mem_mgr_alloc_and_map(struct cam_mem_mgr_alloc_cmd *cmd)
 				"Failed in map_hw_va, len=%llu, flags=0x%x, fd=%d, region=%d, num_hdl=%d, rc=%d",
 				cmd->len, cmd->flags, fd, region,
 				cmd->num_hdl, rc);
+			mutex_unlock(&tbl.m_lock);
 			goto map_hw_fail;
 		}
 	}
-
+	mutex_unlock(&tbl.m_lock);
 	mutex_lock(&tbl.bufq[idx].q_lock);
 	tbl.bufq[idx].fd = fd;
 	tbl.bufq[idx].dma_buf = NULL;
@@ -769,6 +779,7 @@ int cam_mem_mgr_map(struct cam_mem_mgr_map_cmd *cmd)
 		return -EINVAL;
 	}
 
+	mutex_lock(&tbl.m_lock);
 	if ((cmd->flags & CAM_MEM_FLAG_HW_READ_WRITE) ||
 		(cmd->flags & CAM_MEM_FLAG_PROTECTED_MODE)) {
 		rc = cam_mem_util_map_hw_va(cmd->flags,
@@ -783,9 +794,11 @@ int cam_mem_mgr_map(struct cam_mem_mgr_map_cmd *cmd)
 				"Failed in map_hw_va, flags=0x%x, fd=%d, region=%d, num_hdl=%d, rc=%d",
 				cmd->flags, cmd->fd, CAM_SMMU_REGION_IO,
 				cmd->num_hdl, rc);
+			mutex_unlock(&tbl.m_lock);
 			goto map_fail;
 		}
 	}
+	mutex_unlock(&tbl.m_lock);
 
 	idx = cam_mem_get_slot();
 	if (idx < 0) {
@@ -1128,6 +1141,10 @@ int cam_mem_mgr_request_mem(struct cam_mem_mgr_request_desc *inp,
 	heap_id = ION_HEAP(ION_SYSTEM_HEAP_ID) |
 		ION_HEAP(ION_CAMERA_HEAP_ID);
 
+	if (inp->size > 0x200000) {
+		heap_id |= ION_HEAP(ION_MMNS_HEAP_ID);
+	}
+
 	rc = cam_mem_util_get_dma_buf(inp->size,
 		heap_id,
 		ion_flag,
@@ -1303,6 +1320,11 @@ int cam_mem_mgr_reserve_memory_region(struct cam_mem_mgr_request_desc *inp,
 
 	heap_id = ION_HEAP(ION_SYSTEM_HEAP_ID) |
 		ION_HEAP(ION_CAMERA_HEAP_ID);
+
+	if (inp->size > 0x200000) {
+		heap_id |= ION_HEAP(ION_MMNS_HEAP_ID);
+	}
+
 	rc = cam_mem_util_get_dma_buf(inp->size,
 		heap_id,
 		0,

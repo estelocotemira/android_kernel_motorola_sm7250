@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/module.h>
@@ -15,12 +15,15 @@ static int32_t cam_flash_driver_cmd(struct cam_flash_ctrl *fctrl,
 	int rc = 0;
 	int i = 0;
 	struct cam_control *cmd = (struct cam_control *)arg;
+	struct cam_sensor_power_ctrl_t  *power_info = NULL;
 
 	if (!fctrl || !arg) {
 		CAM_ERR(CAM_FLASH, "fctrl/arg is NULL with arg:%pK fctrl%pK",
 			fctrl, arg);
 		return -EINVAL;
 	}
+
+	power_info = &fctrl->power_info;
 
 	if (cmd->handle_type != CAM_HANDLE_USER_POINTER) {
 		CAM_ERR(CAM_FLASH, "Invalid handle type: %d",
@@ -123,6 +126,16 @@ static int32_t cam_flash_driver_cmd(struct cam_flash_ctrl *fctrl,
 			CAM_WARN(CAM_FLASH, "Power Down Failed");
 
 		fctrl->flash_state = CAM_FLASH_STATE_INIT;
+
+		/*MOT_FLASHLIGHT_GPIO BEGIN*/
+		if (soc_private->is_gpio_flash && (NULL != power_info)) {
+			kfree(power_info->power_setting);
+			kfree(power_info->power_down_setting);
+			power_info->power_setting = NULL;
+			power_info->power_down_setting = NULL;
+			power_info->power_setting_size = 0;
+			power_info->power_down_setting_size = 0;
+		} /*MOT_FLASHLIGHT_GPIO END*/
 		break;
 	}
 	case CAM_QUERY_CAP: {
@@ -174,6 +187,10 @@ static int32_t cam_flash_driver_cmd(struct cam_flash_ctrl *fctrl,
 		}
 
 		cam_flash_off(fctrl);
+		/*MOT_FLASHLIGHT_GPIO BEGIN*/
+		if (soc_private->is_gpio_flash) {
+			cam_flash_gpio_off(fctrl);
+		} /*MOT_FLASHLIGHT_GPIO END*/
 		fctrl->func_tbl.flush_req(fctrl, FLUSH_ALL, 0);
 		fctrl->last_flush_req = 0;
 		fctrl->flash_state = CAM_FLASH_STATE_ACQUIRE;
@@ -342,6 +359,25 @@ static int32_t cam_flash_i2c_driver_remove(struct i2c_client *client)
 	return rc;
 }
 
+static int cam_flash_subdev_open(struct v4l2_subdev *sd,
+	struct v4l2_subdev_fh *fh)
+{
+	struct cam_flash_ctrl *fctrl =
+		v4l2_get_subdevdata(sd);
+
+	if (!fctrl) {
+		CAM_ERR(CAM_FLASH, "Flash ctrl ptr is NULL");
+		return -EINVAL;
+	}
+
+	mutex_lock(&fctrl->flash_mutex);
+	fctrl->open_cnt++;
+	CAM_DBG(CAM_FLASH, "Flash open count %d", fctrl->open_cnt);
+	mutex_unlock(&fctrl->flash_mutex);
+
+	return 0;
+}
+
 static int cam_flash_subdev_close(struct v4l2_subdev *sd,
 	struct v4l2_subdev_fh *fh)
 {
@@ -354,7 +390,14 @@ static int cam_flash_subdev_close(struct v4l2_subdev *sd,
 	}
 
 	mutex_lock(&fctrl->flash_mutex);
-	cam_flash_shutdown(fctrl);
+	if (fctrl->open_cnt <= 0) {
+		mutex_unlock(&fctrl->flash_mutex);
+		return -EINVAL;
+	}
+	fctrl->open_cnt--;
+	CAM_DBG(CAM_FLASH, "Flash open count %d", fctrl->open_cnt);
+	if (fctrl->open_cnt == 0)
+		cam_flash_shutdown(fctrl);
 	mutex_unlock(&fctrl->flash_mutex);
 
 	return 0;
@@ -372,6 +415,7 @@ static struct v4l2_subdev_ops cam_flash_subdev_ops = {
 };
 
 static const struct v4l2_subdev_internal_ops cam_flash_internal_ops = {
+	.open  = cam_flash_subdev_open,
 	.close = cam_flash_subdev_close,
 };
 
@@ -396,6 +440,29 @@ static int cam_flash_init_subdev(struct cam_flash_ctrl *fctrl)
 
 	return rc;
 }
+
+static bool cam_flash_find_sku_to_use_pmic()
+{
+	char boot[6] = {'\0'};
+	char *match = (char *)strnstr(saved_command_line, "androidboot.radio=", strlen(saved_command_line));
+
+	if (match) {
+		memcpy(boot, (match + strlen("androidboot.radio=")), sizeof(boot)-1);
+		CAM_INFO(CAM_FLASH, "androidboot.radio is %s", boot);
+		if (strnstr(boot, "JAPAN", strlen(boot))
+			|| strnstr(boot, "EMLA", strlen(boot))
+			|| strnstr(boot, "AUS", strlen(boot))) {
+			/* SKU JAPAN or EMLA(EU/EMA) use PMIC*/
+			return true;
+		} else {
+			/* SKU VZW or NA use GPIO*/
+			return false;
+		}
+	}
+	CAM_ERR(CAM_FLASH, "NO SKU please check cmdline androidboot.radio");
+	return false;
+}
+
 
 static int32_t cam_flash_platform_probe(struct platform_device *pdev)
 {
@@ -476,12 +543,41 @@ static int32_t cam_flash_platform_probe(struct platform_device *pdev)
 		fctrl->func_tbl.apply_setting = cam_flash_i2c_apply_setting;
 		fctrl->func_tbl.power_ops = cam_flash_i2c_power_ops;
 		fctrl->func_tbl.flush_req = cam_flash_i2c_flush_request;
+	} else if (of_find_property(pdev->dev.of_node, "gpio-flash-support", NULL)) {
+		if (cam_flash_find_sku_to_use_pmic()) {
+			/* PMIC Flash */
+			fctrl->func_tbl.parser = cam_flash_pmic_gpio_pkt_parser;
+			fctrl->func_tbl.apply_setting = cam_flash_pmic_gpio_apply_setting;
+			fctrl->func_tbl.power_ops = cam_flash_pmic_gpio_power_ops;
+			fctrl->func_tbl.flush_req = cam_flash_pmic_gpio_flush_request;
+		} else {
+			/* MOT_FLASHLIGHT_GPIO GPIO Flash */
+			fctrl->func_tbl.parser = cam_flash_gpio_pkt_parser;
+			fctrl->func_tbl.apply_setting = cam_flash_gpio_apply_setting;
+			fctrl->func_tbl.power_ops = cam_flash_gpio_power_ops;
+			fctrl->func_tbl.flush_req = cam_flash_gpio_flush_request;
+            }
 	} else {
-		/* PMIC Flash */
-		fctrl->func_tbl.parser = cam_flash_pmic_pkt_parser;
-		fctrl->func_tbl.apply_setting = cam_flash_pmic_apply_setting;
-		fctrl->func_tbl.power_ops = cam_flash_pmic_power_ops;
-		fctrl->func_tbl.flush_req = cam_flash_pmic_flush_request;
+		if (fctrl->soc_info.gpio_data) {
+			rc = cam_sensor_util_request_gpio_table(
+				&fctrl->soc_info,
+				true);
+			if (rc) {
+				CAM_ERR(CAM_FLASH,
+					"GPIO table request failed: rc: %d",
+					rc);
+				goto free_gpio_resource;
+			}
+		}
+		/* PMIC GPIO Flash */
+		fctrl->func_tbl.parser =
+			cam_flash_pmic_gpio_pkt_parser;
+		fctrl->func_tbl.apply_setting =
+			cam_flash_pmic_gpio_apply_setting;
+		fctrl->func_tbl.power_ops =
+			cam_flash_pmic_gpio_power_ops;
+		fctrl->func_tbl.flush_req =
+			cam_flash_pmic_gpio_flush_request;
 	}
 
 	rc = cam_flash_init_subdev(fctrl);
@@ -503,12 +599,17 @@ static int32_t cam_flash_platform_probe(struct platform_device *pdev)
 	mutex_init(&(fctrl->flash_mutex));
 
 	fctrl->flash_state = CAM_FLASH_STATE_INIT;
+	fctrl->open_cnt = 0;
 	CAM_DBG(CAM_FLASH, "Probe success");
 	return rc;
 
 free_cci_resource:
 	kfree(fctrl->io_master_info.cci_client);
 	fctrl->io_master_info.cci_client = NULL;
+free_gpio_resource:
+	cam_sensor_util_request_gpio_table(&fctrl->soc_info, false);
+	kfree(fctrl->soc_info.gpio_data);
+	fctrl->soc_info.gpio_data = NULL;
 free_resource:
 	kfree(fctrl->i2c_data.per_frame);
 	kfree(fctrl->soc_info.soc_private);
@@ -588,6 +689,7 @@ static int32_t cam_flash_i2c_driver_probe(struct i2c_client *client,
 
 	mutex_init(&(fctrl->flash_mutex));
 	fctrl->flash_state = CAM_FLASH_STATE_INIT;
+	fctrl->open_cnt = 0;
 
 	return rc;
 
