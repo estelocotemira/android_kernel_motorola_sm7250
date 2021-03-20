@@ -28,6 +28,7 @@
 #include <linux/major.h>
 #include <linux/slab.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/of.h>
 
 #define FMT_STRING	"%s"
 #define FMT_INTEGER	"%d"
@@ -536,6 +537,40 @@ static int ts_mmi_default_pinctrl(struct device *parent, int on)
 	return 0;
 }
 
+#define BOOTMODE_MAX_LEN 64
+const char *mmi_bl_bootmode(void)
+{
+	const char *bootargs = NULL;
+	char *end = NULL;
+	char *idx = NULL;
+	struct device_node *np;
+	static char bootmode[BOOTMODE_MAX_LEN] = {'\0'};
+
+	if (bootmode[0] != '\0')
+		return bootmode;
+
+	np = of_find_node_by_path("/chosen");
+	if (np == NULL)
+		return NULL;
+
+	if (of_property_read_string(np, "bootargs", &bootargs) != 0)
+		goto putnode;
+
+	idx = strstr(bootargs, "androidboot.mode=");
+	if (idx) {
+		end = strpbrk(idx, " ");
+		idx = strpbrk(idx, "=");
+		if (idx && end > idx)
+			strlcpy(bootmode, idx + 1, end - idx);
+	}
+
+putnode:
+	of_node_put(np);
+	return bootmode;
+}
+
+EXPORT_SYMBOL(mmi_bl_bootmode);
+
 /**
  * ts_mmi_dev_register - register a new object of ts_mmi_dev class.
  * @parent: The device to register.
@@ -562,6 +597,12 @@ int ts_mmi_dev_register(struct device *parent,
 	mutex_init(&touch_cdev->extif_mutex);
 	mutex_init(&touch_cdev->method_mutex);
 
+#ifdef CONFIG_DRM_PANEL_NOTIFICATIONS
+	ret = ts_mmi_check_drm_panel(DEV_TS->of_node);
+	if (ret < 0)
+		goto PANEL_PARSE_DT_FAILED;
+#endif
+
 	ret = ts_mmi_parse_dt(touch_cdev, DEV_TS->of_node);
 	if (ret < 0) {
 		dev_err(DEV_TS, "%s: init panel failed. %d\n", __func__, ret);
@@ -586,7 +627,11 @@ int ts_mmi_dev_register(struct device *parent,
 
 	ts_mmi_get_vendor_info(touch_cdev);
 
+#if defined(CONFIG_TS_KERNEL_USE_GKI)
+	ret = 256;
+#else
 	ret = input_get_new_minor(-1, 1, true);
+#endif
 	if (ret < 0) {
 		dev_info(DEV_TS, "%s: get minor number failed. %d\n",
 			__func__, ret);
@@ -684,7 +729,9 @@ CLASS_DEVICE_ATTR_CREATE_FAILED:
 	device_unregister(DEV_MMI);
 CLASS_DEVICE_CREATE_FAILED:
 	DEV_MMI = NULL;
+#ifndef CONFIG_TS_KERNEL_USE_GKI
 	input_free_minor(touch_cdev->class_dev_minor);
+#endif
 	touch_cdev->class_dev_minor = 0;
 GET_NEW_MINOT_FAILED:
 	ts_mmi_panel_unregister(touch_cdev);
@@ -732,11 +779,37 @@ void ts_mmi_dev_unregister(struct device *parent)
 	sysfs_remove_group(&DEV_MMI->kobj, &sysfs_class_group);
 	device_unregister(DEV_MMI);
 	DEV_MMI = NULL;
+#ifndef CONFIG_TS_KERNEL_USE_GKI
 	input_free_minor(touch_cdev->class_dev_minor);
+#endif
 	touch_cdev->class_dev_minor = 0;
 	devm_kfree(parent, touch_cdev);
 }
 EXPORT_SYMBOL(ts_mmi_dev_unregister);
+
+bool ts_mmi_is_panel_match(const char *panel_node, char *touch_ic_name)
+{
+	struct device_node *of_chosen;
+	const char *panel_name;
+
+	of_chosen = of_find_node_by_path("/chosen");
+	if (of_chosen == NULL)
+		of_chosen = of_find_node_by_path("/chosen@0");
+
+	if (of_chosen == NULL)
+		return false;
+
+	if (of_property_read_string(of_chosen, panel_node, &panel_name)) {
+		pr_err("%s: Failed to get %s", __func__, panel_node);
+		return false;
+	}
+
+	if (strstr(panel_name, touch_ic_name))
+			return true;
+
+	return false;
+}
+EXPORT_SYMBOL(ts_mmi_is_panel_match);
 
 static int __init touchscreens_init(void)
 {

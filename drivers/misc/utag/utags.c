@@ -142,6 +142,7 @@ struct ctrl {
 	struct work_struct load_work;
 	struct work_struct store_work;
 	struct utag *head;
+	int store_work_result;
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
@@ -1142,11 +1143,15 @@ static int store_utags(struct ctrl *ctrl, struct utag *tags)
 
 	if (open_utags(cb)) {
 		rc = -EIO;
-		goto out;
+		goto err_free;
 	}
 	fp = cb->filep;
 
+#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
+	written = kernel_write(fp, datap, tags_size, &pos);
+#else
 	written = vfs_write(fp, datap, tags_size, &pos);
+#endif
 	if (written < tags_size) {
 		pr_err("failed to write file (%s), rc=%zu\n",
 			cb->name, written);
@@ -1156,19 +1161,28 @@ static int store_utags(struct ctrl *ctrl, struct utag *tags)
 	/* Only try to use backup partition if it is configured */
 	if (ctrl->backup.name) {
 		cb = &ctrl->backup;
-		if (open_utags(cb))
-			goto out;
+		if (open_utags(cb)) {
+			rc = -EIO;
+			goto err_free;
+		}
 		fp = cb->filep;
 		pos = 0;
 
+#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
+		written = kernel_write(fp, datap, tags_size, &pos);
+#else
 		written = vfs_write(fp, datap, tags_size, &pos);
-		if (written < tags_size)
+#endif
+		if (written < tags_size) {
 			pr_err("failed to write file (%s), rc=%zu\n",
 				cb->name, written);
+			rc = -EIO;
+		}
 	}
-	vfree(datap);
 
- out:
+err_free:
+	vfree(datap);
+out:
 	set_fs(fs);
 	return rc;
 }
@@ -1185,6 +1199,7 @@ void store_work_func(struct work_struct *work)
 	rc = store_utags(ctrl, ctrl->head);
 	if (rc)
 		pr_err("error storing utags partition\n");
+	ctrl->store_work_result = rc;
 	complete(&ctrl->store_comp);
 }
 
@@ -1341,6 +1356,8 @@ static ssize_t write_utag(struct file *file, const char __user *buffer,
 
 	queue_work(ctrl->store_queue, &ctrl->store_work);
 	wait_for_completion(&ctrl->store_comp);
+	if (ctrl->store_work_result)
+		count = ctrl->store_work_result;
 free_tags_exit:
 	free_tags(tags);
 free_temp_exit:
@@ -1436,6 +1453,8 @@ static ssize_t delete_utag(struct file *file, const char __user *buffer,
 	/* Store changed partition */
 	queue_work(ctrl->store_queue, &ctrl->store_work);
 	wait_for_completion(&ctrl->store_comp);
+	if (ctrl->store_work_result)
+		count = ctrl->store_work_result;
 	rebuild_utags_directory(ctrl);
 just_leave:
 	free_tags(tags);
@@ -1629,6 +1648,8 @@ static ssize_t new_utag(struct file *file, const char __user *buffer,
 	/* Store changed partition */
 	queue_work(ctrl->store_queue, &ctrl->store_work);
 	wait_for_completion(&ctrl->store_comp);
+	if (ctrl->store_work_result)
+		ret = ctrl->store_work_result;
 just_leave:
 	free_tags(tags);
 	mutex_unlock(&ctrl->access_lock);
@@ -1892,6 +1913,16 @@ static int utags_dt_init(struct platform_device *pdev)
 static int utags_dt_init(struct platform_device *pdev) { return -EINVAL; }
 #endif
 
+static int utags_remove_proc_subtree(const char *name, struct proc_dir_entry *parent)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+	return remove_proc_subtree(name, parent);
+#else
+	//walkaround the symbol is not in GKI abl list
+	return 0;
+#endif
+};
+
 static void clear_utags_directory(struct ctrl *ctrl)
 {
 	struct proc_node *node, *s = NULL;
@@ -1901,7 +1932,7 @@ static void clear_utags_directory(struct ctrl *ctrl)
 		if (dir_node->parent != ctrl->root)
 			continue;
 		/* remove whole subtree of first level subdir */
-		remove_proc_subtree(dir_node->name, ctrl->root);
+		utags_remove_proc_subtree(dir_node->name, ctrl->root);
 
 		pr_debug("removing subtree [%s]\n", dir_node->name);
 
@@ -1929,6 +1960,11 @@ static int utags_probe(struct platform_device *pdev)
 	int rc;
 	struct ctrl *ctrl;
 	char buf[UTAGS_QNAME_SIZE];
+
+	if (!try_module_get(THIS_MODULE)) {
+		pr_err("Failed to get this utags module\n");
+		return -EIO;
+	}
 
 	ctrl = devm_kzalloc(&pdev->dev, sizeof(struct ctrl), GFP_KERNEL);
 	if (!ctrl)
@@ -1974,6 +2010,12 @@ static int utags_probe(struct platform_device *pdev)
 		return -EIO;
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
+	/* force this driver to be unloadable because the proc tree cannot
+	   be removed in GKI 5.4  */
+	module_put(THIS_MODULE);
+#endif
+
 	if (!strncmp(ctrl->dir_name, HW_ROOT, sizeof(HW_ROOT)))
 		ctrl->hwtag = 1;
 
@@ -1981,7 +2023,7 @@ static int utags_probe(struct platform_device *pdev)
 		pr_err("Failed to create reload entry\n");
 		destroy_workqueue(ctrl->load_queue);
 		destroy_workqueue(ctrl->store_queue);
-		remove_proc_subtree(ctrl->dir_name, NULL);
+		utags_remove_proc_subtree(ctrl->dir_name, NULL);
 		return -EIO;
 	}
 
@@ -1989,7 +2031,7 @@ static int utags_probe(struct platform_device *pdev)
 		pr_err("Failed to create util dir\n");
 		destroy_workqueue(ctrl->load_queue);
 		destroy_workqueue(ctrl->store_queue);
-		remove_proc_subtree(ctrl->dir_name, NULL);
+		utags_remove_proc_subtree(ctrl->dir_name, NULL);
 		return -EFAULT;
 	}
 
@@ -2002,7 +2044,7 @@ static int utags_remove(struct platform_device *pdev)
 	struct ctrl *ctrl = dev_get_drvdata(&pdev->dev);
 
 	clear_utags_directory(ctrl);
-	remove_proc_subtree(ctrl->dir_name, NULL);
+	utags_remove_proc_subtree(ctrl->dir_name, NULL);
 	destroy_workqueue(ctrl->load_queue);
 	destroy_workqueue(ctrl->store_queue);
 	if (ctrl->main.filep)
@@ -2045,5 +2087,8 @@ late_initcall(utags_init);
 module_exit(utags_exit);
 
 MODULE_LICENSE("GPL");
+#if KERNEL_VERSION(5, 4, 0) <= LINUX_VERSION_CODE
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
 MODULE_AUTHOR("Motorola Mobility LLC");
 MODULE_DESCRIPTION("Configuration module");
