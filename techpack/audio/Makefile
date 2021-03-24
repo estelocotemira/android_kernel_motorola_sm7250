@@ -68,10 +68,6 @@ ifeq ($(CONFIG_SMITH_DTB), y)
 LINUXINCLUDE    += \
                 -include $(srctree)/techpack/audio/config/litosmith.h
 endif
-ifeq ($(CONFIG_KIEV_DTB), y)
-LINUXINCLUDE    += \
-                -include $(srctree)/techpack/audio/config/litokiev.h
-endif
 
 obj-y += soc/
 obj-y += dsp/
