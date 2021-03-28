@@ -242,4 +242,7 @@ source "drivers/tzlog_dump/Kconfig"
 source "drivers/watchdog_cpu_ctx/Kconfig"
 
 source "drivers/watchdogtest/Kconfig"
+
+source "drivers/gud/Kconfig"
+
 endmenu
