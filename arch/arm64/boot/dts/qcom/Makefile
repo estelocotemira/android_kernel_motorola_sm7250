@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0
-# Do not include QC default DTBs if not needed
-ifneq ($(CONFIG_MMI_DEVICE_DTBS),y)
 dtb-$(CONFIG_ARCH_QCOM)	+= apq8016-sbc.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= apq8096-db820c.dtb
 dtb-$(CONFIG_ARCH_QCOM)	+= ipq8074-hk01.dtb
@@ -13,4 +11,3 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sdm845-mtp.dtb
 always		:= $(dtb-y)
 subdir-y	:= $(dts-dirs)
 clean-files    := *.dtb *.dtbo
-endif # CONFIG_MMI_DEVICE_DTBS
